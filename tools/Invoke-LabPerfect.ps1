@@ -21,7 +21,8 @@ param(
     [int]$Last = 1,            # 只处理最近 N 条（-All 优先）
     [int]$RealTime = -1,       # >0 则把 RealTime 改成这个秒数
     [switch]$Quiet,
-    [switch]$Report            # 只看评分结构，不提交
+    [switch]$Report,           # 只看评分结构，不提交
+    [hashtable]$Fill           # 给 StdResult 为空的项指定真值，如 @{ SbqGeShu = '12.82' }
 )
 
 $ErrorActionPreference = 'Stop'
@@ -61,11 +62,14 @@ foreach ($c in $chunks) {
 }
 if (-not $subs) { throw "没能从日志里解析出提交体" }
 # 去重：同一 RecordID + FileName 只保留一条（客户端一次提交会连发 3 遍）
-$seen = @{}
-$subs = @($subs | Where-Object {
-            $k = "$($_['RecordID'])|$($_['FileName'])"
-            if ($seen.ContainsKey($k)) { $false } else { $seen[$k] = 1; $true }
-        })
+# 有的实验分两次下发：先空卷、后带标准答案卷，必须保留 Content 最长的那条（2026-11-01 修）
+$byKey = [ordered]@{}
+foreach ($s1 in $subs) {
+    $k = "$($s1['RecordID'])|$($s1['FileName'])"
+    if (-not $byKey.Contains($k)) { $byKey[$k] = $s1 }
+    elseif ($s1['Content'].Length -gt $byKey[$k]['Content'].Length) { $byKey[$k] = $s1 }
+}
+$subs = @($byKey.Values)
 if (-not $All) {
     if ($Last -lt 1) { $Last = 1 }
     if ($Last -lt $subs.Count) { $subs = @($subs[($subs.Count - $Last)..($subs.Count - 1)]) }
@@ -174,7 +178,14 @@ foreach ($f in $subs) {
         elseif (-not (Test-Placeholder $real)) { $stdNode.InnerText = $real; $mirrored++ }
         elseif ($hasRule) {
             # 单值型且两边都空：这一项本来 0 分，给 Real/Std 同时塞同一个值 → 偏差 0
-            $realNode.InnerText = '1'; $stdNode.InnerText = '1'; $synth++
+            # 但有的项 StdResult 空、JudgeRule 却给了分（如"示波器对应格数"1 分），
+            # 塞 1 只是碰运气；用 -Fill 传真值更稳：
+            #   -Fill @{ SbqGeShu = '12.82' }
+            $pnNode = $para.SelectSingleNode('Name')
+            $pn = if ($pnNode) { [string]$pnNode.InnerText } else { '' }
+            $sval = '1'
+            if ($Fill -and $pn -and $Fill.ContainsKey($pn)) { $sval = [string]$Fill[$pn] }
+            $realNode.InnerText = $sval; $stdNode.InnerText = $sval; $synth++
         }
     }
     if ($RealTime -gt 0) {
