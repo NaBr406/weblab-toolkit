@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -6,7 +6,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 
-// 极简 HTTP 抓包代理：把应用发往 192.168.2.221:8001 的请求原样记录下来
+// 极简 HTTP 抓包代理：把应用发往实验服务端（conf 或默认地址）的请求原样记录下来
 // 用法: HttpSpy.exe <listenPort> <logDir>
 //   支持明文 HTTP 转发 + CONNECT 隧道（HTTPS 也能通，只记录 CONNECT 目标）
 class HttpSpy
