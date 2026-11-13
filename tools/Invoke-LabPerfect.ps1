@@ -26,7 +26,9 @@ param(
     [switch]$Quiet,
     [switch]$Report,           # 只看评分结构，不提交
     [hashtable]$Fill,          # 给 StdResult 为空的项指定真值，如 @{ SbqGeShu = '12.82' }
-    [switch]$NoSynthesize      # 两边都空的项不塞 '1'，保持空白（只对表格型/单值型都生效）
+    [switch]$NoSynthesize,     # 两边都空的项不塞 '1'，保持空白（只对表格型/单值型都生效）
+    [string]$Server,           # 手动指定服务端，如 http://10.0.0.5:8001（默认从抓包日志的请求行推断）
+    [switch]$KeepTemp          # 保留临时目录（里面有解出的原包和改好的 perfect.xml，排查用）
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,6 +39,36 @@ if (-not $LogPath) { $LogPath = Join-Path $here 'capture\requests.log' }
 if (-not (Test-Path $LogPath)) { throw "没有抓包日志：$LogPath（先 .\proxy-on.ps1 再做一次实验）" }
 
 function Log2($m) { if (-not $Quiet) { Write-Host $m } }
+
+# 找一个真正可写的临时目录。
+# 为什么不直接用 %TEMP%：本仓库常见部署位置是 D:\ 下的普通目录，那里的文件带
+# Low Mandatory Level（低完整性）标签，从该目录启动的进程也是低完整性，而
+# %TEMP% 是 Medium —— New-Item 会直接 UnauthorizedAccessException。
+# 顺序：脚本目录下的 .tmp → %TEMP% → 报错。
+function New-ScratchDir([string]$prefix) {
+    foreach ($cand in @((Join-Path $here '.tmp'), [IO.Path]::GetTempPath())) {
+        try {
+            if (-not (Test-Path $cand)) {
+                New-Item -ItemType Directory -Force -Path $cand -ErrorAction Stop | Out-Null
+            }
+            $d = Join-Path $cand ($prefix + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Force -Path $d -ErrorAction Stop | Out-Null
+            return $d
+        } catch { }
+    }
+    throw "没有可写的临时目录（已试 $here\.tmp 和 %TEMP%）"
+}
+
+# Content 在 body 里的形态不统一：多数实验直接是 base64，
+# 少数客户端会做一次 URL 编码（base64 里的 + / = 变成 %2B %2F %3D）。
+# 两种都试，谁先解开用谁。
+function ConvertFrom-B64Flexible([string]$v) {
+    try { return [Convert]::FromBase64String($v) } catch { }
+    $u = $v
+    try { $u = [uri]::UnescapeDataString($u.Replace('+', ' ')) } catch { }
+    return [Convert]::FromBase64String($u)
+}
+
 function Test-Placeholder([string]$v) {
     # 模板里的"假标准值"：空 / 0 / 0.000 / NaN —— 照抄只会让相对偏差变成 0/0
     $s = "$v".Trim()
@@ -65,10 +97,25 @@ function Measure-StdCells([string]$v) {
 # 调 LabDecrypt.exe。PS 5.1 在 $ErrorActionPreference='Stop' 下会把外部程序的
 # stderr 提升成终止性错误（明文 XML 的实验必然触发），所以这里临时降级并吞掉输出，
 # 只返回退出码。调用方靠"输出文件是否存在"判断成败。
+#
+# 另外 Component.dll 是 .NET 2.x 的混淆程序集（类型名如 cwsQigtUY2cZbGk4AvO.*），
+# 在 .NET 4 CLR 下 JIT 偶发 InvalidProgramException，进程直接以 -532462766 退出，
+# 控制台只留一句"由于 Exception.ToString() 失败"。实测干净环境连跑 40 次 0 失败，
+# 但并发编译 / 32 位宿主命中过，所以失败静默重试一次（成本约 100ms）。
+$script:decFlaky = 0
 function Invoke-Dec([string]$mode, [string]$inPath, [string]$outPath) {
     $old = $ErrorActionPreference
     $ErrorActionPreference = 'SilentlyContinue'
-    try { & $dec $mode $inPath $outPath 2>&1 | Out-Null; return $LASTEXITCODE }
+    try {
+        for ($try = 1; $try -le 2; $try++) {
+            if (Test-Path $outPath) { Remove-Item $outPath -Force -ErrorAction SilentlyContinue }
+            & $dec $mode $inPath $outPath 2>&1 | Out-Null
+            $ec = $LASTEXITCODE
+            if ($ec -eq 0 -and (Test-Path $outPath)) { return 0 }
+            if ($try -eq 1) { $script:decFlaky++ }
+        }
+        return $ec
+    }
     finally { $ErrorActionPreference = $old }
 }
 
@@ -84,10 +131,9 @@ function Get-StdScore([string]$contentB64) {
     $score = -1
     try {
         if (-not $script:scoreTmp) {
-            $script:scoreTmp = Join-Path ([IO.Path]::GetTempPath()) ("lpf_score_" + [guid]::NewGuid().ToString('N'))
-            New-Item -ItemType Directory -Force -Path $script:scoreTmp | Out-Null
+            $script:scoreTmp = New-ScratchDir 'lpf_score_'
         }
-        $bytes2 = [Convert]::FromBase64String($contentB64)
+        $bytes2 = ConvertFrom-B64Flexible $contentB64
         $bx = Join-Path $script:scoreTmp 'c.bin'
         $ox = Join-Path $script:scoreTmp 'c.xml'
         [IO.File]::WriteAllBytes($bx, $bytes2)
@@ -120,6 +166,9 @@ if (-not $chunks) { throw "日志里没有 /ServiceAPI/UpdateRecord 提交（确
 
 $subs = @()
 foreach ($c in $chunks) {
+    # 请求行里的目标地址才是真正的服务端（body 里没有 ServerIP 字段）
+    $host2 = ''
+    if ($c -match 'POST (https?://[^/\s]+)/ServiceAPI/UpdateRecord') { $host2 = $Matches[1] }
     if ($c -match '(?s)---- body \((\d+) bytes\) ----\r?\n(.*)$') {
         $bodyText = $Matches[2].Trim()
         if ($bodyText -notmatch 'UserID=') { continue }
@@ -128,10 +177,14 @@ foreach ($c in $chunks) {
             $i = $kv.IndexOf('=')
             if ($i -gt 0) { $f[$kv.Substring(0, $i)] = $kv.Substring($i + 1) }
         }
-        if ($f.ContainsKey('Content') -and $f.ContainsKey('Key')) { $subs += , $f }
+        if ($f.ContainsKey('Content') -and $f.ContainsKey('Key')) {
+            $f['__host'] = $host2
+            $subs += , $f
+        }
     }
 }
 if (-not $subs) { throw "没能从日志里解析出提交体" }
+$rawCount = $subs.Count
 # 去重：同一 RecordID + FileName 只保留一条（客户端一次提交会连发 3 遍）
 # 有的实验分两次下发：先空卷、后带标准答案卷。判据不是"谁更长"，而是
 # 解密后谁的"真标准值格子"多；打平才回退 Content 长度（2026-11-13 修）。
@@ -166,11 +219,10 @@ if (-not $All) {
     if ($Last -lt 1) { $Last = 1 }
     if ($Last -lt $subs.Count) { $subs = @($subs[($subs.Count - $Last)..($subs.Count - 1)]) }
 }
-Log2 ("找到 {0} 条提交（{1} 组重复已合并，本次处理 {2} 条）" -f $chunks.Count, $dupeGroups, $subs.Count)
+Log2 ("找到 {0} 条提交（{1} 组重复已合并，本次处理 {2} 条）" -f $rawCount, $dupeGroups, $subs.Count)
 
 # ---------- 2. 逐条处理 ----------
-$tmp = Join-Path ([IO.Path]::GetTempPath()) ("lpf_" + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+$tmp = New-ScratchDir 'lpf_'
 
 $okCount = 0
 foreach ($f in $subs) {
@@ -178,7 +230,7 @@ foreach ($f in $subs) {
     Log2 ("===== {0} =====" -f $tag)
 
     # 2.1 解出 Content
-    $encBytes = [Convert]::FromBase64String($f['Content'])
+    $encBytes = ConvertFrom-B64Flexible $f['Content']
     $encPath = Join-Path $tmp 'content.bin'
     [IO.File]::WriteAllBytes($encPath, $encBytes)
     $xmlPath = Join-Path $tmp 'content.xml'
@@ -204,9 +256,8 @@ foreach ($f in $subs) {
         Log2 "  ---- 评分结构（分值 × 行数，'空' = 该参数没有标准值）----"
         $tot = 0
         foreach ($p in $doc.SelectNodes('//Para')) {
-            $jr = $p.SelectSingleNode('JudgeRule/Rule/Score')
-            if (-not $jr) { continue }
             $perNode = $p.SelectSingleNode('JudgeRule/Rule/Score')
+            if (-not $perNode) { continue }
             $per = 0; [void][int]::TryParse([string]$perNode.InnerText, [ref]$per)
             $stdNode2 = $p.SelectSingleNode('StdResult')
             $std2 = if ($stdNode2) { [string]$stdNode2.InnerText } else { '' }
@@ -249,7 +300,11 @@ foreach ($f in $subs) {
             if ($realParts.Count -gt 1) { $realBody = @($realParts[1..($realParts.Count - 1)]) }
             $out = @()
             for ($r = 0; $r -lt $stdRows.Count; $r++) {
-                $sc = @(([string]$stdRows[$r]).Trim('(', ')').Split(','))
+                $rowRaw = [string]$stdRows[$r]
+                # 行内到底带不带括号要跟原样一致：有的实验写 "(1,2,3)"，有的直接 "1,2,3"。
+                # 无条件补括号会把不带括号的格式改坏（服务端按行拆分时会对不上，整行判 0 分）。
+                $paren = $rowRaw.Trim().StartsWith('(') -or $rowRaw.Trim().EndsWith(')')
+                $sc = @($rowRaw.Trim('(', ')').Split(','))
                 $rc = @()
                 if ($r -lt $realBody.Count) { $rc = @(([string]$realBody[$r]).Trim('(', ')').Split(',')) }
                 # RealResult 行比 StdResult 短时补齐列数，避免索引越界
@@ -262,8 +317,10 @@ foreach ($f in $subs) {
                     elseif ($NoSynthesize) { $skipped++ }              # 都空且要求不补造 → 原样留白
                     else { $rc[$c] = '1'; $sc[$c] = '1'; $synth++ }     # 都空 → 双双造一个
                 }
-                $out += '(' + ($rc -join ',') + ')'
-                $stdRows[$r] = '(' + ($sc -join ',') + ')'
+                $rcJ = $rc -join ','; $scJ = $sc -join ','
+                if ($paren) { $rcJ = '(' + $rcJ + ')'; $scJ = '(' + $scJ + ')' }
+                $out += $rcJ
+                $stdRows[$r] = $scJ
             }
             $realNode.InnerText = $hdr + ';' + ($out -join ';')
             $stdNode.InnerText  = $hdr + ';' + ($stdRows -join ';')
@@ -309,8 +366,16 @@ foreach ($f in $subs) {
         continue
     }
 
-    $server = "http://192.168.2.221:8001"
-    if ($f.ContainsKey('ServerIP') -and $f['ServerIP']) { $server = $f['ServerIP'] }
+    # 重放目标：-Server > 抓包日志请求行里的真实地址 > body 里的 ServerIP 字段。
+    # 旧版这里写死过一个内网地址，换机房/换学校就发错地方（2026-11-13 修）。
+    $server = ''
+    if ($Server) { $server = $Server.TrimEnd('/') }
+    elseif ($f.ContainsKey('__host') -and $f['__host']) { $server = $f['__host'] }
+    elseif ($f.ContainsKey('ServerIP') -and $f['ServerIP']) { $server = $f['ServerIP'] }
+    if (-not $server) {
+        Write-Warning "  日志里没有请求行，分不清服务端地址，跳过 $tag（可用 -Server http://ip:port 指定）"
+        continue
+    }
     # 兼容 PowerShell 5.1 / 7：5.1 没有 -SkipHttpErrorCheck，用 try/catch 取响应体
     $savedProxy = [System.Net.WebRequest]::DefaultWebProxy
     try {
@@ -346,8 +411,15 @@ foreach ($f in $subs) {
     if ($code.Trim() -eq '1') { $okCount++ }
 }
 
-Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+if ($KeepTemp) {
+    Log2 ("  临时文件保留在：{0}" -f $tmp)
+} else {
+    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+}
 if ($script:scoreTmp) { Remove-Item $script:scoreTmp -Recurse -Force -ErrorAction SilentlyContinue }
+if ($script:decFlaky -gt 0) {
+    Log2 ("  （解密进程重试过 {0} 次：Component.dll 偶发 JIT 崩溃，已自动恢复）" -f $script:decFlaky)
+}
 Log2 ""
 if ($Apply) { Log2 ("完成：{0}/{1} 条成功" -f $okCount, $subs.Count) }
 else { Log2 "以上为预览。加 -Apply 才会真正提交。" }

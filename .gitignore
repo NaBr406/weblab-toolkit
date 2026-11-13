@@ -3,6 +3,7 @@ tools/capture/
 tools/proxy-state.json
 
 # 临时/备份
+tools/.tmp/
 *.bak
 *.tmp
 *.dec.xml
