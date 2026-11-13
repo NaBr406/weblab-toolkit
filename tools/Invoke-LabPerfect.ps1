@@ -13,6 +13,9 @@
 #   .\Invoke-LabPerfect.ps1                      # 预览最新一条提交（DryRun）
 #   .\Invoke-LabPerfect.ps1 -Apply               # 真正重放
 #   .\Invoke-LabPerfect.ps1 -Apply -All          # 重放日志里所有提交（多个实验一起刷）
+#   .\Invoke-LabPerfect.ps1 -Apply -Fill @{ SbqGeShu = '12.82' }
+#                                                # 给 StdResult 为空的项指定真值
+#   .\Invoke-LabPerfect.ps1 -Apply -NoSynthesize # 两边都空的项不补造，原样留着
 #
 param(
     [string]$LogPath,          # 默认 tools\capture\requests.log
@@ -22,7 +25,8 @@ param(
     [int]$RealTime = -1,       # >0 则把 RealTime 改成这个秒数
     [switch]$Quiet,
     [switch]$Report,           # 只看评分结构，不提交
-    [hashtable]$Fill           # 给 StdResult 为空的项指定真值，如 @{ SbqGeShu = '12.82' }
+    [hashtable]$Fill,          # 给 StdResult 为空的项指定真值，如 @{ SbqGeShu = '12.82' }
+    [switch]$NoSynthesize      # 两边都空的项不塞 '1'，保持空白（只对表格型/单值型都生效）
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,6 +44,73 @@ function Test-Placeholder([string]$v) {
     if ($s -match "^(?i)nan$") { return $true }
     if ($s -match "^-?0(\.0*)?$") { return $true }
     return $false
+}
+
+# 一格里有多少个"真标准值"：表格型按格子数，单值型最多 1
+function Measure-StdCells([string]$v) {
+    $s = "$v"
+    if ($s.Contains(';')) {
+        $n = 0
+        $parts = $s -split ';'
+        for ($i2 = 1; $i2 -lt $parts.Count; $i2++) {
+            foreach ($cell in ([string]$parts[$i2]).Trim('(', ')').Split(',')) {
+                if (-not (Test-Placeholder $cell)) { $n++ }
+            }
+        }
+        return $n
+    }
+    if (Test-Placeholder $s) { return 0 } else { return 1 }
+}
+
+# 调 LabDecrypt.exe。PS 5.1 在 $ErrorActionPreference='Stop' 下会把外部程序的
+# stderr 提升成终止性错误（明文 XML 的实验必然触发），所以这里临时降级并吞掉输出，
+# 只返回退出码。调用方靠"输出文件是否存在"判断成败。
+function Invoke-Dec([string]$mode, [string]$inPath, [string]$outPath) {
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try { & $dec $mode $inPath $outPath 2>&1 | Out-Null; return $LASTEXITCODE }
+    finally { $ErrorActionPreference = $old }
+}
+
+# 去重打分：解密后数整份 XML 里"有真标准值的格子"总数。
+# 返回 -1 = 这份 Content 解不开（既非加密包也非明文 XML），排序时垫底。
+$script:scoreTmp = $null
+$script:scoreCache = @{}
+function Get-StdScore([string]$contentB64) {
+    $h = [BitConverter]::ToString(
+            [Security.Cryptography.SHA256]::Create().ComputeHash(
+                [Text.Encoding]::ASCII.GetBytes("$contentB64"))).Replace('-', '')
+    if ($script:scoreCache.ContainsKey($h)) { return $script:scoreCache[$h] }
+    $score = -1
+    try {
+        if (-not $script:scoreTmp) {
+            $script:scoreTmp = Join-Path ([IO.Path]::GetTempPath()) ("lpf_score_" + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Force -Path $script:scoreTmp | Out-Null
+        }
+        $bytes2 = [Convert]::FromBase64String($contentB64)
+        $bx = Join-Path $script:scoreTmp 'c.bin'
+        $ox = Join-Path $script:scoreTmp 'c.xml'
+        [IO.File]::WriteAllBytes($bx, $bytes2)
+        if (Test-Path $ox) { Remove-Item $ox -Force -ErrorAction SilentlyContinue }
+        [void](Invoke-Dec 'dec' $bx $ox)
+        $d2 = $null
+        if (Test-Path $ox) {
+            try { $t = New-Object System.Xml.XmlDocument; $t.Load($ox); $d2 = $t } catch { $d2 = $null }
+        }
+        if (-not $d2) {
+            try { $t = New-Object System.Xml.XmlDocument; $t.LoadXml([Text.Encoding]::UTF8.GetString($bytes2)); $d2 = $t } catch { $d2 = $null }
+        }
+        if ($d2) {
+            $score = 0
+            foreach ($p2 in $d2.SelectNodes('//Para')) {
+                $n2 = $p2.SelectSingleNode('StdResult')
+                if (-not $n2) { continue }
+                $score += Measure-StdCells ([string]$n2.InnerText)
+            }
+        }
+    } catch { $score = -1 }
+    $script:scoreCache[$h] = $score
+    return $score
 }
 
 # ---------- 1. 从日志切出提交 ----------
@@ -62,19 +133,40 @@ foreach ($c in $chunks) {
 }
 if (-not $subs) { throw "没能从日志里解析出提交体" }
 # 去重：同一 RecordID + FileName 只保留一条（客户端一次提交会连发 3 遍）
-# 有的实验分两次下发：先空卷、后带标准答案卷，必须保留 Content 最长的那条（2026-11-01 修）
-$byKey = [ordered]@{}
+# 有的实验分两次下发：先空卷、后带标准答案卷。判据不是"谁更长"，而是
+# 解密后谁的"真标准值格子"多；打平才回退 Content 长度（2026-11-13 修）。
+# 位置按最后一次出现记，避免 [ordered]@{}.Values 保留首次位置、让 -Last 选错。
+$groups = [ordered]@{}
+$idx = 0
+$dupeGroups = 0
 foreach ($s1 in $subs) {
     $k = "$($s1['RecordID'])|$($s1['FileName'])"
-    if (-not $byKey.Contains($k)) { $byKey[$k] = $s1 }
-    elseif ($s1['Content'].Length -gt $byKey[$k]['Content'].Length) { $byKey[$k] = $s1 }
+    if (-not $groups.Contains($k)) { $groups[$k] = New-Object System.Collections.ArrayList }
+    [void]$groups[$k].Add(@{ idx = $idx; item = $s1 })
+    $idx++
 }
-$subs = @($byKey.Values)
+$picked = @()
+foreach ($k in @($groups.Keys)) {
+    $cands = $groups[$k]
+    if ($cands.Count -eq 1) { $picked += $cands[0]; continue }
+    $dupeGroups++
+    $best = $null; $bestScore = -99; $bestLen = -1
+    foreach ($c in $cands) {
+        $sc = Get-StdScore ([string]$c.item['Content'])
+        $len = ([string]$c.item['Content']).Length
+        if ($sc -gt $bestScore -or ($sc -eq $bestScore -and $len -gt $bestLen)) {
+            $best = $c; $bestScore = $sc; $bestLen = $len
+        }
+    }
+    if ($bestScore -lt 0) { Write-Warning "  同一记录的多份 Content 都解析不了，退回按长度选：$k" }
+    $picked += $best
+}
+$subs = @($picked | Sort-Object { $_.idx } | ForEach-Object { $_.item })
 if (-not $All) {
     if ($Last -lt 1) { $Last = 1 }
     if ($Last -lt $subs.Count) { $subs = @($subs[($subs.Count - $Last)..($subs.Count - 1)]) }
 }
-Log2 ("找到 {0} 条提交（本次处理 {1} 条）" -f $chunks.Count, $subs.Count)
+Log2 ("找到 {0} 条提交（{1} 组重复已合并，本次处理 {2} 条）" -f $chunks.Count, $dupeGroups, $subs.Count)
 
 # ---------- 2. 逐条处理 ----------
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("lpf_" + [guid]::NewGuid().ToString('N'))
@@ -90,7 +182,8 @@ foreach ($f in $subs) {
     $encPath = Join-Path $tmp 'content.bin'
     [IO.File]::WriteAllBytes($encPath, $encBytes)
     $xmlPath = Join-Path $tmp 'content.xml'
-    & $dec dec $encPath $xmlPath 2>$null | Out-Null
+    if (Test-Path $xmlPath) { Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue }
+    [void](Invoke-Dec 'dec' $encPath $xmlPath)
     $doc = New-Object System.Xml.XmlDocument
     $loaded = $false
     if (Test-Path $xmlPath) {
@@ -135,7 +228,7 @@ foreach ($f in $subs) {
 
     # 2.2 填数据
     $doc.DocumentElement.SetAttribute('__patched', '1') | Out-Null
-    $filled = 0; $mirrored = 0; $synth = 0
+    $filled = 0; $mirrored = 0; $synth = 0; $skipped = 0
     foreach ($para in $doc.SelectNodes('//Para')) {
         $stdNode  = $para.SelectSingleNode('StdResult')
         $realNode = $para.SelectSingleNode('RealResult')
@@ -166,6 +259,7 @@ foreach ($f in $subs) {
                     if ($c -eq 0) { continue }                     # 序号列不动
                     if (-not (Test-Placeholder $sv)) { $rc[$c] = $sv; $filled++ }   # 真标准值 → 照抄
                     elseif (-not (Test-Placeholder $rv)) { $sc[$c] = $rv; $mirrored++ }  # 有填写 → 反填
+                    elseif ($NoSynthesize) { $skipped++ }              # 都空且要求不补造 → 原样留白
                     else { $rc[$c] = '1'; $sc[$c] = '1'; $synth++ }     # 都空 → 双双造一个
                 }
                 $out += '(' + ($rc -join ',') + ')'
@@ -176,6 +270,7 @@ foreach ($f in $subs) {
         }
         elseif (-not (Test-Placeholder $std)) { $realNode.InnerText = $std; $filled++ }
         elseif (-not (Test-Placeholder $real)) { $stdNode.InnerText = $real; $mirrored++ }
+        elseif ($NoSynthesize -and $hasRule) { $skipped++ }
         elseif ($hasRule) {
             # 单值型且两边都空：这一项本来 0 分，给 Real/Std 同时塞同一个值 → 偏差 0
             # 但有的项 StdResult 空、JudgeRule 却给了分（如"示波器对应格数"1 分），
@@ -192,12 +287,17 @@ foreach ($f in $subs) {
         $n = $doc.SelectSingleNode('//Title/User/Time/RealTime')
         if ($n) { $n.InnerText = "$RealTime" }
     }
-    Log2 ("  填入 {0} 格 / 反填 {1} 格 / 补造 {2} 格" -f $filled, $mirrored, $synth)
+    $tail = ""
+    if ($skipped -gt 0) { $tail = " / 跳过 $skipped 格（-NoSynthesize）" }
+    Log2 ("  填入 {0} 格 / 反填 {1} 格 / 补造 {2} 格{3}" -f $filled, $mirrored, $synth, $tail)
 
     $newXml = Join-Path $tmp 'perfect.xml'
     $doc.Save($newXml)
     $newBin = Join-Path $tmp 'perfect.bin'
-    & $dec enc $newXml $newBin | Out-Null
+    if ((Invoke-Dec 'enc' $newXml $newBin) -ne 0 -or -not (Test-Path $newBin)) {
+        Write-Warning "重新加密失败，跳过 $tag"
+        continue
+    }
 
     # 2.3 组包（Key 原样复用）
     $content2 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($newBin))
@@ -247,6 +347,7 @@ foreach ($f in $subs) {
 }
 
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+if ($script:scoreTmp) { Remove-Item $script:scoreTmp -Recurse -Force -ErrorAction SilentlyContinue }
 Log2 ""
 if ($Apply) { Log2 ("完成：{0}/{1} 条成功" -f $okCount, $subs.Count) }
 else { Log2 "以上为预览。加 -Apply 才会真正提交。" }
