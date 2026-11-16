@@ -3,9 +3,17 @@ tools/capture/
 tools/proxy-state.json
 
 # 临时/备份
+tools/.tmp/
 *.bak
 *.tmp
 *.dec.xml
 
-# 构建产物（如需分发可保留）
-# tools/*.exe
+# 构建产物：由 tools\build.ps1 在本地生成，不进仓库
+tools/*.exe
+tools/*.pdb
+*.exe
+*.pdb
+
+# 第三方组件：原厂版权，需自备（见 README「三、硬性前提」第 5 条）
+tools/USTCORi.*
+*.dll

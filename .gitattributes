@@ -1,0 +1,10 @@
+# 换行统一：仓库里存 LF，签出时转回 CRLF
+# Windows PowerShell 5.1 与老 csc.exe 都更适应 CRLF。
+# BOM 属于文件内容（在 .ps1/.cs 开头），不受换行转换影响，请勿删除。
+* text=auto
+*.ps1  text eol=crlf
+*.cs   text eol=crlf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.md   text eol=crlf
+*.json text eol=crlf

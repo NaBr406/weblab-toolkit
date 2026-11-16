@@ -1,4 +1,5 @@
 ﻿# proxy-off.ps1 —— 关闭抓包代理，并把系统代理还原成开启前的样子
+$ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $key  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 $stateFile = Join-Path $here 'proxy-state.json'
